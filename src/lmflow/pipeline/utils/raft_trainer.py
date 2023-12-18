@@ -356,8 +356,7 @@ class RaftTrainer:
 
         # Setup Sharded DDP training
         self.sharded_ddp = None
-        if len(args.sharded_ddp) > 0:
-            raise
+
 
         self.fsdp = None
         if len(args.fsdp) > 0:
