@@ -357,6 +357,8 @@ class RaftTrainer:
         # Setup Sharded DDP training
         self.sharded_ddp = None
 
+        self.create_accelerator_and_postprocess()
+
 
         self.fsdp = None
         if len(args.fsdp) > 0:
@@ -3558,207 +3560,51 @@ class RaftTrainer:
                 logger.error(f"Error pushing update to the model card. Please read logs and retry.\n${exc}")
 
         return git_head_commit_url
+        
+    def create_accelerator_and_postprocess(self):
+            from accelerate import Accelerator
+            from accelerate.utils import GradientAccumulationPlugin
+            grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
+            grad_acc_kwargs["sync_with_dataloader"] = False
+            gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
 
-    #
-    # Deprecated code
-    #
+            # create accelerator object
+            self.accelerator = Accelerator(
+                dispatch_batches=self.args.dispatch_batches,
+                split_batches=self.args.split_batches,
+                deepspeed_plugin=self.args.deepspeed_plugin,
+                gradient_accumulation_plugin=gradient_accumulation_plugin,
+            )
+            # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
+            self.gather_function = self.accelerator.gather_for_metrics
 
-    def prediction_loop(
-        self,
-        dataloader: DataLoader,
-        description: str,
-        prediction_loss_only: Optional[bool] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
-    ) -> EvalLoopOutput:
-        """
-        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
-        Works both with or without labels.
-        """
-        args = self.args
+            # deepspeed and accelerate flags covering both trainer args and accelerate launcher
+            self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+            self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
 
-        if not has_length(dataloader):
-            raise ValueError("dataloader must implement a working __len__")
-
-        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
-
-        # if eval is called w/o train init deepspeed here
-        if args.deepspeed and not self.deepspeed:
-            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
-            # from the checkpoint eventually
-            deepspeed_engine, _, _ = deepspeed_init(self, num_training_steps=0, resume_from_checkpoint=None)
-            self.model = deepspeed_engine.module
-            self.model_wrapped = deepspeed_engine
-            self.deepspeed = deepspeed_engine
-            # XXX: we don't need optim/sched for inference, but this needs to be sorted out, since
-            # for example the Z3-optimizer is a must for zero3 to work even for inference - what we
-            # don't need is the deepspeed basic optimizer which is self.optimizer.optimizer
-            deepspeed_engine.optimizer.optimizer = None
-            deepspeed_engine.lr_scheduler = None
-
-        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
-
-        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
-        # while ``train`` is running, cast it to the right dtype first and then put on device
-        if not self.is_in_train:
-            if args.fp16_full_eval:
-                model = model.to(dtype=torch.float16, device=args.device)
-            elif args.bf16_full_eval:
-                model = model.to(dtype=torch.bfloat16, device=args.device)
-
-        batch_size = dataloader.batch_size
-        num_examples = self.num_examples(dataloader)
-        logger.info(f"***** Running {description} *****")
-        logger.info(f"  Num examples = {num_examples}")
-        logger.info(f"  Batch size = {batch_size}")
-        losses_host: torch.Tensor = None
-        preds_host: Union[torch.Tensor, List[torch.Tensor]] = None
-        labels_host: Union[torch.Tensor, List[torch.Tensor]] = None
-        inputs_host: Union[torch.Tensor, List[torch.Tensor]] = None
-
-        world_size = max(1, args.world_size)
-
-        eval_losses_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=batch_size)
-        if not prediction_loss_only:
-            # The actual number of eval_sample can be greater than num_examples in distributed settings (when we pass
-            # a batch size to the sampler)
-            make_multiple_of = None
-            if hasattr(dataloader, "sampler") and isinstance(dataloader.sampler, SequentialDistributedSampler):
-                make_multiple_of = dataloader.sampler.batch_size
-            preds_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=make_multiple_of)
-            labels_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=make_multiple_of)
-            inputs_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=make_multiple_of)
-
-        model.eval()
-
-        if is_torch_tpu_available():
-            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
-
-        if args.past_index >= 0:
-            self._past = None
-
-        self.callback_handler.eval_dataloader = dataloader
-
-        for step, inputs in enumerate(dataloader):
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            inputs_decode = self._prepare_input(inputs["input_ids"]) if args.include_inputs_for_metrics else None
-
-            if loss is not None:
-                losses = loss.repeat(batch_size)
-                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
-            if logits is not None:
-                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
-            if labels is not None:
-                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
-            if inputs_decode is not None:
-                inputs_host = (
-                    inputs_decode
-                    if inputs_host is None
-                    else nested_concat(inputs_host, inputs_decode, padding_index=-100)
+            # post accelerator creation setup
+            if self.is_fsdp_enabled:
+                fsdp_plugin = self.accelerator.state.fsdp_plugin
+                fsdp_plugin.limit_all_gathers = self.args.fsdp_config.get(
+                    "limit_all_gathers", fsdp_plugin.limit_all_gathers
                 )
-            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+                if is_accelerate_available("0.23.0"):
+                    fsdp_plugin.activation_checkpointing = self.args.fsdp_config.get(
+                        "activation_checkpointing", fsdp_plugin.activation_checkpointing
+                    )
+                    if fsdp_plugin.activation_checkpointing and self.args.gradient_checkpointing:
+                        raise ValueError(
+                            "The activation_checkpointing in FSDP config and the gradient_checkpointing in training arg "
+                            "can't be set to True simultaneously. Please use FSDP's activation_checkpointing logic "
+                            "when using FSDP."
+                        )
 
-            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
-            if args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
-                eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
-                if not prediction_loss_only:
-                    preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
-                    labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
-                    inputs_gatherer.add_arrays(self._gather_and_numpify(inputs_host, "eval_inputs_ids"))
+            if self.is_deepspeed_enabled:
+                if getattr(self.args, "hf_deepspeed_config", None) is None:
+                    from transformers.integrations.deepspeed import HfTrainerDeepSpeedConfig
 
-                # Set back to None to begin a new accumulation
-                losses_host, preds_host, labels_host, inputs_host = None, None, None, None
+                    ds_plugin = self.accelerator.state.deepspeed_plugin
 
-        if args.past_index and hasattr(self, "_past"):
-            # Clean the state at the end of the evaluation loop
-            delattr(self, "_past")
-
-        # Gather all remaining tensors and put them back on the CPU
-        eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
-        if not prediction_loss_only:
-            preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
-            labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
-            inputs_gatherer.add_arrays(self._gather_and_numpify(inputs_host, "eval_inputs_ids"))
-
-        eval_loss = eval_losses_gatherer.finalize()
-        preds = preds_gatherer.finalize() if not prediction_loss_only else None
-        label_ids = labels_gatherer.finalize() if not prediction_loss_only else None
-        inputs_ids = inputs_gatherer.finalize() if not prediction_loss_only else None
-
-        if self.compute_metrics is not None and preds is not None and label_ids is not None:
-            if args.include_inputs_for_metrics:
-                metrics = self.compute_metrics(
-                    EvalPrediction(predictions=preds, label_ids=label_ids, inputs=inputs_ids)
-                )
-            else:
-                metrics = self.compute_metrics(EvalPrediction(predictions=preds, label_ids=label_ids))
-        else:
-            metrics = {}
-
-        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
-        metrics = denumpify_detensorize(metrics)
-
-        if eval_loss is not None:
-            metrics[f"{metric_key_prefix}_loss"] = eval_loss.mean().item()
-
-        # Prefix all keys with metric_key_prefix + '_'
-        for key in list(metrics.keys()):
-            if not key.startswith(f"{metric_key_prefix}_"):
-                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
-
-        return EvalLoopOutput(predictions=preds, label_ids=label_ids, metrics=metrics, num_samples=num_examples)
-
-    def _gather_and_numpify(self, tensors, name):
-        """
-        Gather value of `tensors` (tensor or list/tuple of nested tensors) and convert them to numpy before
-        concatenating them to `gathered`
-        """
-        if tensors is None:
-            return
-        if is_torch_tpu_available():
-            tensors = nested_xla_mesh_reduce(tensors, name)
-        elif is_sagemaker_mp_enabled():
-            tensors = smp_gather(tensors)
-        elif self.args.local_rank != -1:
-            tensors = distributed_concat(tensors)
-
-        return nested_numpify(tensors)
-
-    def _add_sm_patterns_to_gitignore(self) -> None:
-        """Add SageMaker Checkpointing patterns to .gitignore file."""
-        # Make sure we only do this on the main process
-        if not self.is_world_process_zero():
-            return
-
-        patterns = ["*.sagemaker-uploading", "*.sagemaker-uploaded"]
-
-        # Get current .gitignore content
-        if os.path.exists(os.path.join(self.repo.local_dir, ".gitignore")):
-            with open(os.path.join(self.repo.local_dir, ".gitignore"), "r") as f:
-                current_content = f.read()
-        else:
-            current_content = ""
-
-        # Add the patterns to .gitignore
-        content = current_content
-        for pattern in patterns:
-            if pattern not in content:
-                if content.endswith("\n"):
-                    content += pattern
-                else:
-                    content += f"\n{pattern}"
-
-        # Write the .gitignore file if it has changed
-        if content != current_content:
-            with open(os.path.join(self.repo.local_dir, ".gitignore"), "w") as f:
-                logger.debug(f"Writing .gitignore file. Content: {content}")
-                f.write(content)
-
-        self.repo.git_add(".gitignore")
-
-        # avoid race condition with git status
-        time.sleep(0.5)
-
-        if not self.repo.is_repo_clean():
-            self.repo.git_commit("Add *.sagemaker patterns to .gitignore.")
-            self.repo.git_push()
+                    ds_plugin.hf_ds_config = HfTrainerDeepSpeedConfig(ds_plugin.hf_ds_config.config)
+                    ds_plugin.deepspeed_config = ds_plugin.hf_ds_config.config
+                    ds_plugin.hf_ds_config.trainer_config_process(self.args)
