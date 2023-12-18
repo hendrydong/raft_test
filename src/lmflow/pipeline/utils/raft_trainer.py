@@ -27,7 +27,6 @@ try:
         default_hp_search_backend,
         get_reporting_integration_callbacks,
         hp_params,
-        is_fairscale_available,
         is_optuna_available,
         is_ray_tune_available,
         is_sigopt_available,
