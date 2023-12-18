@@ -41,7 +41,6 @@ except ImportError:
     from transformers.integrations import (
     get_reporting_integration_callbacks,
     hp_params,
-    is_fairscale_available,
     )
     from transformers.hyperparameter_search import default_hp_search_backend,ALL_HYPERPARAMETER_SEARCH_BACKENDS
 
@@ -172,14 +171,6 @@ if is_torch_tpu_available(check_device=False):
     import torch_xla.debug.metrics as met
     import torch_xla.distributed.parallel_loader as pl
 
-if is_fairscale_available():
-    dep_version_check("fairscale")
-    import fairscale
-    from fairscale.nn.data_parallel import FullyShardedDataParallel as FullyShardedDDP
-    from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-    from fairscale.nn.wrap import auto_wrap
-    from fairscale.optim import OSS
-    from fairscale.optim.grad_scaler import ShardedGradScaler
 
 
 if is_sagemaker_mp_enabled():
@@ -378,13 +369,6 @@ class RaftTrainer:
 
             if args.local_rank == -1:
                 raise ValueError("Using sharded DDP only works in distributed training.")
-            elif not is_fairscale_available():
-                raise ImportError("Sharded DDP training requires fairscale: `pip install fairscale`.")
-            elif ShardedDDPOption.SIMPLE not in args.sharded_ddp and FullyShardedDDP is None:
-                raise ImportError(
-                    "Sharded DDP in a mode other than simple training requires fairscale version >= 0.3, found "
-                    f"{fairscale.__version__}. Upgrade your fairscale library: `pip install --upgrade fairscale`."
-                )
             elif ShardedDDPOption.SIMPLE in args.sharded_ddp:
                 self.sharded_ddp = ShardedDDPOption.SIMPLE
             elif ShardedDDPOption.ZERO_DP_2 in args.sharded_ddp:
