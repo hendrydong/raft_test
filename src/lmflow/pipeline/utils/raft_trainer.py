@@ -695,9 +695,7 @@ class RaftTrainer(Trainer):
             else:
                 debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
-        delay_optimizer_creation = (
-            self.fsdp is not None
-        )
+        delay_optimizer_creation = False
         if args.deepspeed:
             deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
                 self, num_training_steps=max_steps, resume_from_checkpoint=resume_from_checkpoint
@@ -1166,7 +1164,7 @@ class RaftTrainer(Trainer):
                 # 'user_content.pt' indicates model state_dict saved with smp >= 1.10
                 Path(os.path.join(output_dir, "user_content.pt")).touch()
         elif (
-            self.fsdp is not None
+            None
         ):
             state_dict = self.model.state_dict()
 
