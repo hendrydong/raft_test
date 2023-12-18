@@ -183,7 +183,7 @@ class HFDecoderModel(DecoderModel, Tunable):
             "use_auth_token": True if model_args.use_auth_token else None,
         }
         if model_args.config_name:
-            config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
+            config = AutoConfig.from_pretrained(model_args.config_name, trust_remote_code=True, **config_kwargs)
         elif model_args.model_name_or_path:
             config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
         else:
@@ -259,6 +259,7 @@ class HFDecoderModel(DecoderModel, Tunable):
                     config=config,
                     cache_dir=model_args.cache_dir,
                     revision=model_args.model_revision,
+                    trust_remote_code=True,
                     use_auth_token=True if model_args.use_auth_token else None,
                     torch_dtype=torch_dtype,
                 )
@@ -305,6 +306,7 @@ class HFDecoderModel(DecoderModel, Tunable):
                         device_map="auto",
                         offload_folder="offload",
                         offload_state_dict=True,
+                        trust_remote_code=True,
                         torch_dtype=torch_dtype,
                         load_in_8bit = model_args.use_int8
                     )
