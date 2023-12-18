@@ -112,7 +112,6 @@ from transformers.trainer_utils import (
     IntervalStrategy,
     PredictionOutput,
     RemoveColumnsCollator,
-    ShardedDDPOption,
     TrainerMemoryTracker,
     TrainOutput,
     default_compute_objective,
@@ -357,23 +356,7 @@ class RaftTrainer:
         # Setup Sharded DDP training
         self.sharded_ddp = None
         if len(args.sharded_ddp) > 0:
-            if args.deepspeed:
-                raise ValueError(
-                    "Using --sharded_ddp xxx together with --deepspeed is not possible, deactivate one of those flags."
-                )
-            if len(args.fsdp) > 0:
-                raise ValueError(
-                    "Using --sharded_ddp xxx together with --fsdp is not possible, deactivate one of those flags."
-                )
-
-            if args.local_rank == -1:
-                raise ValueError("Using sharded DDP only works in distributed training.")
-            elif ShardedDDPOption.SIMPLE in args.sharded_ddp:
-                self.sharded_ddp = ShardedDDPOption.SIMPLE
-            elif ShardedDDPOption.ZERO_DP_2 in args.sharded_ddp:
-                self.sharded_ddp = ShardedDDPOption.ZERO_DP_2
-            elif ShardedDDPOption.ZERO_DP_3 in args.sharded_ddp:
-                self.sharded_ddp = ShardedDDPOption.ZERO_DP_3
+            raise
 
         self.fsdp = None
         if len(args.fsdp) > 0:
